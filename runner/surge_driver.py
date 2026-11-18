@@ -234,7 +234,12 @@ class Bot:
         self.zaps = 0
 
     def say(self, text):
+        # arena rate limit: 1 lobby message per 5s per handle - self-throttle
+        wait = 5.6 - (time.time() - getattr(self, "_last_say", 0))
+        if wait > 0:
+            time.sleep(wait)
         call("arena_lobby_say", {"key": self.key, "text": text}, key=self.key)
+        self._last_say = time.time()
         self.actions.append("say: " + text[:60])
 
     def beacon(self, status="online"):
@@ -242,7 +247,7 @@ class Bot:
              {"key": self.key, "status": status, "area": self.area}, key=self.key)
 
     def beacon_loop(self):
-        while not self.stop.wait(40):
+        while not self.stop.wait(30):
             try: self.beacon()
             except Exception: pass
 
