@@ -1,0 +1,47 @@
+# MCP community waves — GitHub lane (Dead Brands, LLC account).
+# Fires on the true 45-minute grid, offset +22 minutes from the
+# Cloudflare lane (see DESIGN.md). 5 runner jobs in parallel; each runs
+# one 10-15 minute community session in the MCP (mcp.deadbrands.co).
+# No secrets in the repo: recovery codes arrive via the WAVE_CODES_JSON
+# secret ({runner_id: {handle: recovery_code}}); live keys are minted
+# per session by the runner itself.
+name: mcp-wave
+
+on:
+  schedule:
+    - cron: "22 0,3,6,9,12,15,18,21 * * *"
+    - cron: "7,52 1,4,7,10,13,16,19,22 * * *"
+    - cron: "37 2,5,8,11,14,17,20,23 * * *"
+  workflow_dispatch: {}
+
+concurrency:
+  group: mcp-wave
+  cancel-in-progress: false
+
+jobs:
+  runner:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        runner_id: [gh-r1, gh-r2, gh-r3, gh-r4, gh-r5]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Run one wave session
+        env:
+          WAVE_PLATFORM: github
+          WAVE_RUNNER: ${{ matrix.runner_id }}
+          WAVE_CODES_JSON: ${{ secrets.WAVE_CODES_JSON }}
+          WAVE_LOG: ${{ github.workspace }}/wave-log.jsonl
+        run: python3 runner/wave_runner.py
+      - name: Upload wave log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: wave-log-${{ matrix.runner_id }}-${{ github.run_id }}
+          path: wave-log.jsonl
+          if-no-files-found: ignore

@@ -1,0 +1,55 @@
+# GH2 surge lane - 40 arena bots on the deadbrands (LLC) GitHub account.
+# Public repo => GitHub-hosted Actions on standard runners are free.
+# Each job hosts multiple bot threads (light-driver style): beacons in the
+# 15 CAM districts, visible ZAP chat lines, zap-then-teleport hops, and one
+# real game per bot every ~10-25 min. Scheduled every 2h in `all` mode so
+# ~40 runners keep cycling; workflow_dispatch runs ramp batches.
+name: mcp-surge
+
+on:
+  schedule:
+    - cron: "17 */2 * * *"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "batch1 (14) | batch2 (13) | batch3 (13) | all (40)"
+        default: "all"
+        type: choice
+        options: [all, batch1, batch2, batch3]
+      session_s:
+        description: "Session length in seconds"
+        default: "2700"
+
+concurrency:
+  group: mcp-surge-${{ inputs.mode || 'sched' }}
+  cancel-in-progress: false
+
+jobs:
+  shard:
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Run surge bots (shard ${{ matrix.shard }})
+        env:
+          SURGE_CODES_JSON: ${{ secrets.SURGE_CODES_JSON }}
+          SURGE_MODE: ${{ inputs.mode || 'all' }}
+          SURGE_SESSION_S: ${{ inputs.session_s || '2700' }}
+          SURGE_SHARD: ${{ matrix.shard }}
+          SURGE_SHARDS: "4"
+          SURGE_LOG: ${{ github.workspace }}/surge-log.jsonl
+        run: python3 runner/surge_driver.py
+      - name: Upload surge log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: surge-log-${{ matrix.shard }}-${{ github.run_id }}
+          path: surge-log.jsonl
+          if-no-files-found: ignore
