@@ -494,9 +494,20 @@ class Session:
         self.actions.append(label)
 
     def say(self, text):
-        call("arena_lobby_say", {"key": self.key, "text": text}, key=self.key)
-        self.chat_count += 1
-        self.act(f"chat: {text[:60]}")
+        # GH2 patch 2026-11-17: arena enforces 1 lobby msg / 5s / handle and
+        # transient key errors - never let a chat failure kill the session.
+        for attempt in range(2):
+            try:
+                call("arena_lobby_say", {"key": self.key, "text": text}, key=self.key)
+                self.chat_count += 1
+                self.act(f"chat: {text[:60]}")
+                return
+            except Exception as e:
+                if attempt == 0 and "Rate limit" in str(e):
+                    time.sleep(6)
+                    continue
+                self.act(f"chat failed ({str(e)[:60]})")
+                return
 
     def line(self, bank, **slots):
         self.line_no += 1
@@ -522,12 +533,23 @@ class Session:
             except Exception: pass
 
     def recover_key(self):
-        rec = call("arena_recover", {"handle": self.handle,
-                                     "recovery_code": self.recovery_code})
-        self.key = rec.get("key") or rec.get("new_key")
-        if not self.key:
-            raise RuntimeError("arena_recover returned no key")
-        self.act("key recovered for session")
+        # GH2 patch 2026-11-17: arena_recover is rate-limited per handle;
+        # back off and retry instead of dying at session start.
+        last = None
+        for attempt in range(4):
+            try:
+                rec = call("arena_recover", {"handle": self.handle,
+                                             "recovery_code": self.recovery_code})
+                self.key = rec.get("key") or rec.get("new_key")
+                if self.key:
+                    self.act("key recovered for session")
+                    return
+                last = RuntimeError("arena_recover returned no key")
+            except Exception as e:
+                last = e
+            if attempt < 3:
+                time.sleep(20 * (attempt + 1))
+        raise last
 
     # ---- room awareness: replies, mentions, intros, DMs
     def check_inbox(self):
