@@ -1,0 +1,36 @@
+# One-shot registrar for the remaining GH2 surge handles (manual dispatch
+# only). Custody leaves the runner ONLY as NaCl-sealed ciphertext.
+name: gh2-register
+
+on:
+  workflow_dispatch:
+    inputs:
+      handles:
+        description: "Comma-separated handles to register"
+        required: true
+      pubkey:
+        description: "Operator X25519 public key (base64) for custody encryption"
+        required: true
+
+jobs:
+  register:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install --quiet pynacl
+      - name: Register handles
+        env:
+          REG_HANDLES: ${{ inputs.handles }}
+          REG_PUBKEY: ${{ inputs.pubkey }}
+        run: python3 runner/register_gh2.py
+      - name: Upload encrypted custody
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reg-custody-${{ github.run_id }}
+          path: custody.enc
+          if-no-files-found: warn
