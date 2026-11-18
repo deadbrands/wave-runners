@@ -159,7 +159,10 @@ def vocab_move(s, used, rng):
     used[mv.split(":")[0]] = used.get(mv.split(":")[0], 0) + 1
     return mv
 
-def play_match(key, game, max_acts=40):
+def play_match(key, game, max_acts=40, cap_s=240):
+    # Hard wall-clock cap: slow arena calls (30s timeouts under load) must
+    # not wedge the bot past its session deadline.
+    t_end = time.time() + cap_s
     join = call("arena_join", {"key": key, "game": game})
     mid = join.get("match_id") or join.get("id")
     if not mid:
@@ -170,6 +173,8 @@ def play_match(key, game, max_acts=40):
         raise RuntimeError("join returned no match_id")
     s = join.get("state") or {}
     for _ in range(15):
+        if time.time() > t_end:
+            break
         if s.get("over") or s.get("legal_moves") or s.get("legal") or "player" in s:
             break
         try:
@@ -182,9 +187,12 @@ def play_match(key, game, max_acts=40):
         time.sleep(3)
     acts = 0
     seating_retries = 0
+    # (cap enforced in the act loop below)
     used_moves = {}
     rng = random.Random(hash((game, mid)) & 0xffffffff)
     while acts < max_acts:
+        if time.time() > t_end:
+            break
         if s.get("over") or s.get("tick", 0) >= s.get("max_ticks", 300) or s.get("shields", 1) <= 0:
             break
         if game == "asteroid_dodge" and "player" in s:
