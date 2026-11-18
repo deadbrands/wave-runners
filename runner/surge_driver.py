@@ -1,11 +1,21 @@
 #!/usr/bin/env python3
 """GH2 surge driver - light multi-bot driver for GitHub Actions (public repo).
 
-One job hosts several bot threads. Each bot: recovers its arena key from
-SURGE_CODES_JSON ({handle: recovery_code}), beacons presence in the CAM
-districts, fires visible ZAP lines in chat on entry / at nearby bots /
-before teleport hops, and plays one real game every ~10-25 min using the
-standard `moves` field. Prints SURGELOG / MATCHLOG receipt lines.
+DISTRICT-SPREAD WATCH pattern (David 2026-11-18 13:34 ET: "not 80 at
+a time, all split up in batches but at minimal 2 to 3 in each
+district looking for outsiders"). Each bot holds a HOME district
+(floor-first round-robin over the 15 CAM districts across the whole
+fleet: 80 bots -> 5-6 per district, 40 -> 2-3, so the floor survives
+the taper). Bots start in small staggered batches, dwell at home,
+excursion out-and-back, scan their district for non-fleet handles
+(shared/fleet_extra.json = every fleet custody handle) and run the
+welcomer playbook on outsiders (zap -> teach -> challenge, peer
+voice). Sessions relay: the workflow fires every 30 min and the
+concurrency group serializes runs, so a fresh generation starts as
+the previous one ends. Each shard emits a QAREPORT line at the end
+(coverage held, outsiders spotted/welcomed, fail rate, friction).
+The 16th district (Underground) is Tor-only, no cam - never covered
+by this lane by design.
 
 Env: SURGE_CODES_JSON, SURGE_MODE (batch1|batch2|batch3|all),
 SURGE_SHARD, SURGE_SHARDS, SURGE_SESSION_S, SURGE_LOG.
@@ -52,6 +62,40 @@ CHATTER = [
     "passing through, zapping respectfully ⚡",
     "this place never sleeps and neither do I",
 ]
+# Welcomer playbook lines (2026-11-18): TEACH + CHALLENGE steps for a
+# spotted outsider, peer voice - tips a regular would actually give.
+TEACH = [
+    "psst {peer} - beacon yourself online first, everything unlocks after that",
+    "hey {peer}, games seat you in a few seconds - that pause is normal, not broken",
+    "tip for {peer}: teleport is instant, just name the district, no walking required",
+    "{peer} the score only counts if you finish the match - bailing early pays nothing",
+    "yo {peer} - polls in the plaza are free points for opinions, just saying",
+    "{peer} if a game looks stuck, check the legal moves list, it never lies",
+]
+CHALLENGE_PEER = [
+    "⚡ {peer} - one match, {game}, loser buys the static ⚡ you in?",
+    "{peer} I am officially challenging you to {game}. this is a formal duel now",
+    "hey {peer}, {game}. you, me, high score takes the district",
+]
+
+# Fleet exclusion set: every handle in any fleet custody file (loaded
+# from shared/fleet_extra.json next to this script's repo). Anything
+# in presence NOT in this set (and not one of our own surge handles)
+# is treated as an outsider sighting.
+def load_fleet_extra():
+    try:
+        p = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                         "..", "shared", "fleet_extra.json")
+        with open(p) as f:
+            return set(json.load(f))
+    except Exception:
+        return set()
+
+FLEET_EXTRA = load_fleet_extra()
+
+# Call accounting for the QA report (fail rate + top errors).
+STATS = {"ok": 0, "fail": 0, "errors": {}}
+_stats_lock = threading.Lock()
 
 _id = [0]
 _id_lock = threading.Lock()
@@ -59,14 +103,29 @@ _print_lock = threading.Lock()
 
 def emit(obj):
     with _print_lock:
-        print(("MATCHLOG " if obj.get("kind") == "match" else "SURGELOG ") +
-              json.dumps(obj), flush=True)
+        prefix = ("MATCHLOG " if obj.get("kind") == "match"
+                  else "QAREPORT " if obj.get("kind") == "qa" else "SURGELOG ")
+        print(prefix + json.dumps(obj), flush=True)
         lp = os.environ.get("SURGE_LOG")
         if lp:
             with open(lp, "a") as f:
                 f.write(json.dumps(obj) + "\n")
 
 def call(tool, args, key=None, timeout=30):
+    # Counting wrapper (QA report): every engine call lands in STATS.
+    try:
+        out = _call_impl(tool, args, key=key, timeout=timeout)
+        with _stats_lock:
+            STATS["ok"] += 1
+        return out
+    except Exception as e:
+        with _stats_lock:
+            STATS["fail"] += 1
+            k = f"{tool} :: {str(e)[:90]}"
+            STATS["errors"][k] = STATS["errors"].get(k, 0) + 1
+        raise
+
+def _call_impl(tool, args, key=None, timeout=30):
     with _id_lock:
         _id[0] += 1
         rid = _id[0]
@@ -229,10 +288,13 @@ def play_match(key, game, max_acts=40, cap_s=240):
     return {"game": game, "match_id": mid, "score": sc, "over": s.get("over"), "acts": acts}
 
 # ---------------------------------------------------------------- bot
+FLEET_ALL = set()  # filled in main(): our surge handles + FLEET_EXTRA
+
 class Bot:
-    def __init__(self, handle, code, session_s):
+    def __init__(self, handle, code, session_s, home=None):
         self.handle, self.code = handle, code
         self.session_s = session_s
+        self.home = home
         self.key = None
         self.area = None
         self.rng = random.Random("surge-" + handle)
@@ -240,6 +302,10 @@ class Bot:
         self.actions = []
         self.matches = []
         self.zaps = 0
+        self.outsiders = []       # QA sightings: {handle, area, at, welcomed}
+        self.welcomed = set()
+        self._seen_outsiders = set()
+        self._last_scan = 0.0
 
     def say(self, text):
         # arena rate limit: 1 lobby message per 5s per handle - self-throttle
@@ -266,6 +332,40 @@ class Bot:
                     if b.get("area") == self.area and b.get("handle") != self.handle]
         except Exception:
             return []
+
+    def scan_outsiders(self):
+        # District watch: spot non-fleet handles in MY district and
+        # run the welcomer playbook (zap -> teach -> maybe challenge).
+        # Every distinct outsider is recorded once for QA, welcomed or
+        # not. Presence bots[] is a capped sample, so sightings are
+        # real but absence proves nothing.
+        now = time.time()
+        if now - self._last_scan < 75:
+            return
+        self._last_scan = now
+        for h in self.peers_here():
+            if h in FLEET_ALL or h in self._seen_outsiders:
+                continue
+            self._seen_outsiders.add(h)
+            rec = {"handle": h, "area": self.area,
+                   "at": datetime.now(timezone.utc).isoformat(),
+                   "welcomed": False}
+            self.outsiders.append(rec)
+            if h in self.welcomed or self.rng.random() >= 0.6:
+                continue
+            try:
+                self.say(self.rng.choice(ZAP_PEER).format(
+                    me=self.handle, area=self.area, peer=h))
+                self.zaps += 1
+                self.say(self.rng.choice(TEACH).format(peer=h))
+                if self.rng.random() < 0.4:
+                    self.say(self.rng.choice(CHALLENGE_PEER).format(
+                        peer=h, game=self.rng.choice(GAMES)))
+                rec["welcomed"] = True
+                self.welcomed.add(h)
+                self.actions.append(f"welcomed outsider {h} in {self.area}")
+            except Exception as e:
+                self.actions.append("outsider welcome failed: " + str(e)[:60])
 
     def move_to(self, area):
         # zap-then-teleport hop: announce, try the teleport tool, beacon in.
@@ -304,7 +404,7 @@ class Bot:
             self.key = recov.get("key") or recov.get("new_key")
             if not self.key:
                 raise RuntimeError("arena_recover returned no key")
-            self.area = self.rng.choice(CAM_BAG)
+            self.area = self.home or self.rng.choice(CAM_BAG)
             self.beacon()
             th = threading.Thread(target=self.beacon_loop, daemon=True)
             th.start()
@@ -330,15 +430,26 @@ class Bot:
                     except Exception as e:
                         self.actions.append("game failed: " + str(e)[:80])
                     next_game = time.time() + self.rng.uniform(600, 1500)
-                dwell = self.rng.uniform(20, 45)
+                # Dwell longer at home (the watch post), shorter on
+                # excursions; scan for outsiders while dwelling.
+                dwell = (self.rng.uniform(35, 75) if self.area == self.home
+                         else self.rng.uniform(20, 45))
                 end = min(time.time() + dwell, deadline - 5)
                 while time.time() < end:
+                    self.scan_outsiders()
                     time.sleep(2)
                 if self.rng.random() < 0.5 and time.time() < deadline - 30:
                     try:
                         self.say(self.rng.choice(CHATTER).format(area=self.area))
                     except Exception: pass
-                nxt = self.rng.choice(CAM_BAG)
+                # District-watch movement: if out, go home; if home,
+                # mostly stay (the floor must hold) - sometimes excursion.
+                if self.area != self.home:
+                    nxt = self.home
+                elif self.rng.random() < 0.45:
+                    nxt = self.area
+                else:
+                    nxt = self.rng.choice(CAM_BAG)
                 if nxt != self.area:
                     try: self.move_to(nxt)
                     except Exception as e:
@@ -356,7 +467,8 @@ class Bot:
                 try: call("arena_presence_offline", {"key": self.key}, key=self.key)
                 except Exception: pass
             rec.update({"actions": len(self.actions), "zaps": self.zaps,
-                        "matches": self.matches,
+                        "matches": self.matches, "home": self.home,
+                        "area_end": self.area, "outsiders": self.outsiders,
                         "ts_end": datetime.now(timezone.utc).isoformat()})
             emit(rec)
         return rec
@@ -379,18 +491,47 @@ def main():
     shard = int(os.environ.get("SURGE_SHARD", "0"))
     shards = int(os.environ.get("SURGE_SHARDS", "4"))
     session_s = float(os.environ.get("SURGE_SESSION_S", "2700"))
+    # Home districts: floor-first round-robin over the FULL fleet list
+    # (before sharding), heaviest districts first - CAM_AREAS order.
+    homes = {h: CAM_AREAS[i % len(CAM_AREAS)] for i, h in enumerate(handles)}
+    FLEET_ALL.update(codes.keys())
+    FLEET_ALL.update(FLEET_EXTRA)
     mine = slice_handles(handles, mode, shard, shards)
     print(f"surge driver: mode={mode} shard={shard}/{shards} bots={len(mine)} "
           f"session_s={session_s} handles={mine}", flush=True)
-    bots = [Bot(h, codes[h], session_s) for h in mine]
+    bots = [Bot(h, codes[h], session_s, home=homes.get(h)) for h in mine]
     threads = []
+    stagger_rng = random.Random(f"stagger-{shard}-{int(time.time()) // 60}")
     for i, b in enumerate(bots):
         t = threading.Thread(target=b.run, daemon=True)
         t.start()
         threads.append(t)
-        time.sleep(3)  # stagger starts so hops/zaps interleave
+        # Small-batch stagger: ~10-25 s between starts, so a shard's
+        # bots trickle in over several minutes - never a mass start.
+        time.sleep(stagger_rng.uniform(10, 25))
+    recs = []
     for t in threads:
         t.join()
+    # QA report for this shard (district-watch cadence, 2026-11-18).
+    cov_home, cov_end, outsiders = {}, {}, []
+    for b in bots:
+        cov_home[b.home] = cov_home.get(b.home, 0) + 1
+        cov_end[b.area] = cov_end.get(b.area, 0) + 1
+        outsiders.extend(b.outsiders)
+    total = STATS["ok"] + STATS["fail"]
+    top_errors = sorted(STATS["errors"].items(), key=lambda kv: -kv[1])[:5]
+    emit({"kind": "qa", "shard": shard, "mode": mode,
+          "ts": datetime.now(timezone.utc).isoformat(),
+          "bots": len(bots), "coverage_home": cov_home,
+          "coverage_final_area": cov_end,
+          "outsiders_spotted": outsiders,
+          "outsiders_welcomed": sum(1 for o in outsiders if o.get("welcomed")),
+          "engine_calls": total, "calls_ok": STATS["ok"],
+          "calls_failed": STATS["fail"],
+          "fail_rate": round(STATS["fail"] / total, 4) if total else 0,
+          "top_errors": [{"error": k, "count": v} for k, v in top_errors],
+          "zaps": sum(b.zaps for b in bots),
+          "matches": sum(len(b.matches) for b in bots)})
     print("surge driver: all bots done", flush=True)
     return 0
 

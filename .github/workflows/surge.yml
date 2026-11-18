@@ -1,14 +1,17 @@
-# GH2 surge lane - 40 arena bots on the deadbrands (LLC) GitHub account.
+# GH2 surge lane - arena bots on the deadbrands (LLC) GitHub account.
 # Public repo => GitHub-hosted Actions on standard runners are free.
-# Each job hosts multiple bot threads (light-driver style): beacons in the
-# 15 CAM districts, visible ZAP chat lines, zap-then-teleport hops, and one
-# real game per bot every ~10-25 min. Scheduled every 2h in `all` mode so
-# ~40 runners keep cycling; workflow_dispatch runs ramp batches.
+# DISTRICT-SPREAD WATCH (2026-11-18): every bot holds a home district
+# (floor-first round-robin, >=2-3 per district at any fleet size),
+# starts in small staggered batches, watches its district for
+# outsiders and runs the welcomer playbook on them. Sessions are
+# 45 min; the schedule fires every 30 min and the concurrency group
+# SERIALIZES runs, so generations relay back-to-back with no gap and
+# no double-fielding. workflow_dispatch runs ramp batches.
 name: mcp-surge
 
 on:
   schedule:
-    - cron: "17 */2 * * *"
+    - cron: "17,47 * * * *"
   workflow_dispatch:
     inputs:
       mode:
